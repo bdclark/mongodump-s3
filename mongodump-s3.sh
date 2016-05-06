@@ -118,9 +118,17 @@ date_day_of_month=$(date -u +%d)
 date_year=$(date -u +%Y)
 last_day_of_month=$(days_in_month "$date_day_of_month" "$date_year")
 backup_name=$(date -u +%Y-%m-%d_%Hh%Mm)
-archive_fname="${backup_name}.tgz"
 s3_archive_fname_match='????-??-??_??h??m.tgz'
 db_host="$host:$port"
+
+if [ -n "$dump_basename" ]; then
+  backup_name="${dump_basename}_${backup_name}"
+  s3_archive_fname_match="${dump_basename}_${s3_archive_fname_match}"
+fi
+archive_fname="${backup_name}.tgz"
+
+dump_dir="${backup_dir}/${backup_name}"
+if [ -d "$dump_dir" ]; then die "backup directory $dump_dir already exists"; fi
 
 if [ -n "$s3_prefix" ]; then bucket="$bucket/$s3_prefix"; fi
 
@@ -130,15 +138,6 @@ if [ -n "$username" ]; then
 fi
 
 if [ "$oplog" = true ]; then opts="$opts --oplog"; fi
-
-# prepend basename if specified
-if [ -n "$dump_basename" ]; then
-  backup_name="${dump_basename}_${backup_name}"
-  s3_archive_fname_match="${dump_basename}_${s3_archive_fname_match}"
-fi
-
-dump_dir="${backup_dir}/${backup_name}"
-if [ -d "$dump_dir" ]; then die "backup directory $dump_dir already exists"; fi
 
 if [ "$dry_run" = true ]; then echo "Dry run enabled"; fi
 
