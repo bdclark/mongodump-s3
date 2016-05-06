@@ -178,7 +178,7 @@ fi
 # do the needful
 echo "Starting mongodump at $(date -u +%Y-%m-%dT%H:%M:%SZ) from $db_host to $backup_dir"
 if [ "$dry_run" != true ]; then
-  mongodump --quiet --host="$db_host" --out="$temp_dir" $auth_opts $opts
+  mongodump --host="$db_host" --out="$temp_dir" $auth_opts $opts
 fi
 
 if [ -n "$dump_basename" ]; then dump_basename="${dump_basename}_"; fi
