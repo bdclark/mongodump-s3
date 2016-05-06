@@ -25,11 +25,6 @@ prefer_slave=true
 oplog=true
 dump_basename=
 
-# don't override these
-auth_opts=
-opts=
-secondary=
-
 usage(){
   echo "Usage: $0 args
     -f PATH config file to use rather than specifying CLI arguments
@@ -67,10 +62,6 @@ days_in_month() {
   (( m==2 )) && a=$((a-2))
   (( m==2 && y%4==0 && ( y<100 || y%100>0 || y%400==0) )) && a=$((a+1))
   printf '%d' $a
-}
-
-cleanup() {
-  rm -rf "$temp_dir"
 }
 
 while getopts ":f:u:p:a:B:H:P:sb:d:n:R:rm:w:lDh" opt; do
@@ -111,38 +102,51 @@ if [ -n "$config_file" ]; then
   source "$config_file"
 fi
 
+# option validation
 if [ -z "$host" ]; then die "host is required"; fi
 if [ -z "$bucket" ]; then die "bucket is required"; fi
 if [[ ! $do_weekly =~ ^[0-7]$ ]]; then die "invalid weekday"; fi
 if [[ ! $do_monthly =~ ^(0|0[0-9]|[12][0-9]|3[01])$ ]]; then die "invalid month day: $do_monthly"; fi
-if [ -n "$s3_prefix" ]; then bucket="$bucket/$s3_prefix"; fi
+if [ ! -d "$backup_dir" ]; then die "$backup_dir does not exist"; fi
 
-if [ "$dry_run" = true ]; then echo "Dry run enabled"; fi
-
-if [ -n "$username" ]; then
-    auth_opts="--username=$username --password=$password"
-    if [ -n "$authdb" ]; then auth_opts="$auth_opts --authenticationDatabase=$authdb"; fi
-fi
-
-if [ "$oplog" = true ]; then opts="$opts --oplog"; fi
-
-temp_dir=$(
-  mktemp -d "${backup_dir}/mongodump-s3.XXXXXX"
-) || die "failed to create temp directory in $backup_dir"
-
-# cleanup on any exit (restart replication, remove temp file, etc.)
-trap cleanup ERR INT TERM EXIT
-
-# stamp=$(date -u +%Y%m%dT%H%MZ)  # UTC ISO-8601
-# s3_stamp_match='????????T????Z' # must be able to match stamp above
-stamp=$(date -u +%Y-%m-%d_%Hh%Mm)
-s3_stamp_match='????-??-??_??h??m'
+# don't override these
+auth_opts=""
+opts=""
+secondary=""
 date_day_of_week=$(date -u +%u)
 date_day_of_month=$(date -u +%d)
 date_year=$(date -u +%Y)
 last_day_of_month=$(days_in_month "$date_day_of_month" "$date_year")
-
+backup_name=$(date -u +%Y-%m-%d_%Hh%Mm)
+archive_fname="${backup_name}.tgz"
+s3_archive_fname_match='????-??-??_??h??m.tgz'
 db_host="$host:$port"
+
+if [ -n "$s3_prefix" ]; then bucket="$bucket/$s3_prefix"; fi
+
+if [ -n "$username" ]; then
+  auth_opts="--username=$username --password=$password"
+  if [ -n "$authdb" ]; then auth_opts="$auth_opts --authenticationDatabase=$authdb"; fi
+fi
+
+if [ "$oplog" = true ]; then opts="$opts --oplog"; fi
+
+# prepend basename if specified
+if [ -n "$dump_basename" ]; then
+  backup_name="${dump_basename}_${backup_name}"
+  s3_archive_fname_match="${dump_basename}_${s3_archive_fname_match}"
+fi
+
+dump_dir="${backup_dir}/${backup_name}"
+if [ -d "$dump_dir" ]; then die "backup directory $dump_dir already exists"; fi
+
+if [ "$dry_run" = true ]; then echo "Dry run enabled"; fi
+
+cleanup() {
+  rm -rf "$dump_dir"
+}
+
+trap cleanup ERR INT TERM EXIT
 
 if [ "$prefer_slave" = true ]; then
   rs=$(
@@ -175,28 +179,27 @@ if [ "$prefer_slave" = true ]; then
   fi
 fi
 
-# do the needful
-echo "Starting mongodump at $(date -u +%Y-%m-%dT%H:%M:%SZ) from $db_host to $backup_dir"
+echo "Starting mongodump at $(date -u +%Y-%m-%dT%H:%M:%SZ) from $db_host to $dump_dir"
 if [ "$dry_run" != true ]; then
-  mongodump --host="$db_host" --out="$temp_dir" $auth_opts $opts
+  mongodump --host="$db_host" --out="$dump_dir" $auth_opts $opts || die "mongodump failed"
 fi
 
-if [ -n "$dump_basename" ]; then dump_basename="${dump_basename}_"; fi
-fname="${dump_basename}${stamp}.tgz"
 if [ "$rotate" = true ]; then
-  s3_path="s3://$bucket/$s3_daily_prefix/$fname"
+  s3_path="s3://$bucket/$s3_daily_prefix/$archive_fname"
 else
-  s3_path="s3://$bucket/$fname"
+  s3_path="s3://$bucket/$archive_fname"
 fi
-echo "Copying backup to $s3_path"
+
+echo "Archiving backup from $dump_dir to $s3_path"
 if [ "$dry_run" != true ]; then
-  tar -C "$temp_dir" -czf - . | aws s3 cp - "$s3_path" --region "$region"
+  cd "$backup_dir"
+  tar -czf - "$backup_name" | aws s3 cp - "$s3_path" --region "$region"
 fi
 
 if [ "$rotate" = true ]; then
   # weekly
   if (( do_weekly == date_day_of_week )); then
-    s3_weekly_path="s3://$bucket/$s3_weekly_prefix/$fname"
+    s3_weekly_path="s3://$bucket/$s3_weekly_prefix/$archive_fname"
     if [ "$dry_run" = true ]; then
       echo "aws s3 cp \"$s3_path\" \"$s3_weekly_path\" --region \"$region\""
     else
@@ -206,7 +209,7 @@ if [ "$rotate" = true ]; then
 
   # monthly
   if (( date_day_of_month == do_monthly || date_day_of_month == last_day_of_month && last_day_of_month < do_monthly )); then
-    s3_monthly_path="s3://$bucket/$s3_monthly_prefix/$fname"
+    s3_monthly_path="s3://$bucket/$s3_monthly_prefix/$archive_fname"
     if [ "$dry_run" = true ]; then
       echo "aws s3 cp \"$s3_path\" \"$s3_monthly_path\" --region \"$region\""
     else
@@ -217,12 +220,12 @@ if [ "$rotate" = true ]; then
   # latest
   if [ "$do_latest" = true ]; then
     if [ "$dry_run" = true ]; then
-      echo "aws s3 cp $s3_path s3://$bucket/$s3_latest_prefix/$fname"
-      echo "aws s3 rm s3://$bucket/$s3_latest_prefix/ --recursive --exclude=\"*\" --include=\"${dump_basename}${s3_stamp_match}.tgz\" --exclude=\"$fname\""
+      echo "aws s3 cp $s3_path s3://$bucket/$s3_latest_prefix/$archive_fname"
+      echo "aws s3 rm s3://$bucket/$s3_latest_prefix/ --recursive --exclude=\"*\" --include=\"$s3_archive_fname_match\" --exclude=\"$archive_fname\""
     else
-      aws s3 cp "$s3_path" "s3://$bucket/$s3_latest_prefix/$fname"
-      # delete all files like "db_name_YYYYMMDDTHHMMZ.sql.gz" except for the one just copied
-      aws s3 rm "s3://$bucket/$s3_latest_prefix/" --recursive --exclude="*" --include="${s3_stamp_match}.tgz" --exclude="$fname"
+      aws s3 cp "$s3_path" "s3://$bucket/$s3_latest_prefix/$archive_fname"
+      # delete all matching except for the one just copied
+      aws s3 rm "s3://$bucket/$s3_latest_prefix/" --recursive --exclude="*" --include="$s3_archive_fname_match" --exclude="$archive_fname"
     fi
   fi
 fi
